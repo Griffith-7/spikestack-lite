@@ -82,6 +82,21 @@ def build_parser():
                         help="Recommended tiny profile: temporal + threshold 2 + augment + cosine, "
                              "10 epochs, dense FFN (206k params, ~57%% CIFAR-10 at ~26 s/epoch). "
                              "Overrides epochs/repeats/temporal/threshold/augment/cosine/no-spikeskip.")
+    parser.add_argument("--gsmc", action="store_true",
+                        help="Enable the fused GSMC memory stage over the Spire T-planes "
+                             "(requires --temporal). Adds long-range memory at a controlled "
+                             "~1.5-2x cost on that stage (tunable via --repeats/T).")
+    parser.add_argument("--exact", action="store_true",
+                        help="Enable the Exact-SNN soft-latency readout head (surrogate warm-start, "
+                             "temperature-annealed) as a regularizer on top of the surrogate path.")
+    parser.add_argument("--exact-weight", type=float, default=1.0,
+                        help="Weight of the exact latency loss relative to the CE loss.")
+    parser.add_argument("--conv-stem", action="store_true",
+                        help="Use a small convolutional stem so the model takes raw (3,32,32) "
+                             "images instead of patchified 48-dim tokens (breaks the FC-only "
+                             "~10%% CIFAR floor).")
+    parser.add_argument("--conv-kernels", type=int, default=32,
+                        help="Channels for the conv stem's two conv layers.")
     return parser
 
 
@@ -92,13 +107,18 @@ def make_transform(augment=False):
     return transforms.Compose(t)
 
 
-def evaluate(model, loader, device):
+def model_input(images, conv_stem):
+    """Raw images for the conv-stem model, patchified tokens otherwise."""
+    return images if conv_stem else patchify(images)
+
+
+def evaluate(model, loader, device, conv_stem=False):
     model.eval()
     correct = total = 0
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
-            outputs = model(patchify(images))
+            outputs = model(model_input(images, conv_stem))
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
@@ -147,13 +167,20 @@ def train(args):
         expansion=args.expansion,
         temporal=args.temporal,
         spike_threshold=args.threshold,
+        use_gsmc=args.gsmc,
+        use_exact=args.exact,
+        exact_weight=args.exact_weight,
+        use_conv_stem=args.conv_stem,
+        conv_kernels=args.conv_kernels,
     ).to(device)
-    if not args.no_spikeskip:
-        print(f"SpikeSkip FFN active: {model.use_spikeskip} (Off => CUDA engine unavailable, dense fallback)")
+    if args.gsmc and not args.temporal:
+        raise SystemExit("--gsmc requires --temporal (GSMC consumes the Spire T-planes).")
+    filt = args.conv_stem  # conv-stem model consumes raw images
     print(f"SpikingTransformer params: {sum(p.numel() for p in model.parameters()):,}  "
           f"FFN in_features={model.blocks[0].ffn.fc2.in_features}  lr={args.lr}  "
           f"augment={args.augment}  cosine={args.cosine}  temporal={args.temporal}  "
-          f"threshold={args.threshold}")
+          f"threshold={args.threshold}  gsmc={args.gsmc}  exact={args.exact}  "
+          f"conv_stem={args.conv_stem}")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -206,8 +233,11 @@ def train(args):
             images, labels = images.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(patchify(images))
+            outputs = model(model_input(images, filt))
             loss = criterion(outputs, labels)
+            if args.exact:
+                # Exact-SNN latency regularizer on the smooth pooled context.
+                loss = loss + model.latency_loss(model._pooled_for_latency, labels)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -225,13 +255,17 @@ def train(args):
         if args.cosine:
             scheduler.step()
 
+        # Anneal the exact-SNN latency head's sharpness (soft -> sharp TTFS).
+        if args.exact:
+            model.anneal_exact((epoch - start_epoch + 1) / max(1, args.epochs))
+
         epoch_time = time.time() - start_time
         fc2_sparsity = (100.0 * _fc2_sparsity[0] / _fc2_calls[0]) if _fc2_calls[0] else float("nan")
         print(f"=== Epoch {epoch + 1} Summary: Avg Loss: {running_loss / len(train_loader):.4f}, "
               f"Train Acc: {100. * correct / total:.2f}%, Time: {epoch_time:.2f}s, "
               f"FC2 sparsity: {fc2_sparsity:.1f}% ===")
 
-        test_acc = evaluate(model, test_loader, device)
+        test_acc = evaluate(model, test_loader, device, conv_stem=filt)
         print(f"*** Test Accuracy: {test_acc:.2f}% ***\n")
 
         if test_acc > best_acc:
