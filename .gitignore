@@ -14,11 +14,11 @@ venv/
 # Trained weights / experiment artifacts
 checkpoints/
 
-# SpikeSkip CUDA engine build artifacts (JIT-compiled on import)
-spikeskip_cuda_engine*.so
-spikeskip_cuda_engine*.pyd
-spikeskip_cuda_engine*.dll
+# SpikeSkip & CUDA engine build artifacts (JIT-compiled on import)
+*_cuda_engine*.so
+*_cuda_engine*.pyd
+*_cuda_engine*.dll
 __pypackages__/
 
 # Data (auto-downloads to ./data)
-data/
+data/

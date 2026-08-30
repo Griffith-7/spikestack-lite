@@ -271,8 +271,19 @@ class SparseLinear(torch.nn.Module):
         return out.view(T, *leading, self.out_features)
 
     def forward(self, x):
-        """Default forward: sparse path for large CUDA layers, dense otherwise."""
-        if (_cuda_engine is not None and x.device.type == "cuda"
-                and self.in_features >= self.sparse_threshold):
-            return self.forward_single(x)
-        return self.linear(x)
+        """Default forward: auto-tune between sparse CSR CUDA and dense cuBLAS based on activation sparsity."""
+        if _cuda_engine is not None and x.device.type == "cuda" and self.in_features >= self.sparse_threshold:
+            # Sample non-zero elements to estimate activation sparsity
+            with torch.no_grad():
+                nnz = (x != 0).sum().item()
+                total = x.numel()
+                sparsity = 1.0 - (nnz / max(1, total))
+
+            # Auto-tune: launch custom SpikeSkip CUDA CSR kernel when sparsity >= 90%,
+            # otherwise route to cuBLAS dense GEMM (which leverages hardware Tensor Cores).
+            if sparsity >= 0.90:
+                if x.dim() >= 3:
+                    return self.forward_multistep(x)
+                return self.forward_single(x)
+
+        return self.linear(x)

@@ -1,26 +1,13 @@
-"""
-Astrocyte Hebbian Spiking Linear Attention -- FINAL SOLUTION
-=============================================================
-A 100% spiking replacement for Transformer self-attention that eliminates the
-N x N attention matrix entirely.
-
-Core mechanism:
-    - Q, K are binarized into spikes via threshold (surrogate gradients).
-    - V is transmitted as multi-level spikes (v_levels=1 -> pure binary,
-      the strictest SNN regime).
-    - Attention is a decaying Hebbian trace K^T V inside an Astrocyte state,
-      normalized by accumulated key mass. No softmax, no score matrix.
-    - Complexity: O(N d^2) time / O(N d + d^2) space vs O(N^2) dense attention.
-
-Result (psMNIST, N=784, 60k x 6 epochs, single RTX 3050):
-    Pure-spiking model: 83.63% TEST accuracy, ~3x faster than dense
-    Transformer baseline at ~40% less VRAM.
-
-All inter-layer signals (Q, K, V, FFN hidden activations) are binary spikes.
-"""
-
+import os
 import torch
 import torch.nn as nn
+
+from spikestack_lite._cuda_loader import load_cuda_extension
+
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+_attn_cu_file = os.path.join(_src_dir, "attention_cuda.cu")
+_attn_cuda_engine = load_cuda_extension("attention_cuda_engine", [_attn_cu_file])
+
 
 
 class SurrogateHeaviside(torch.autograd.Function):
@@ -38,6 +25,60 @@ class SurrogateHeaviside(torch.autograd.Function):
 
 
 spike_fn = SurrogateHeaviside.apply
+
+
+class _ChannelDecayAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, k, lam, engine):
+        N = k.size(-2)
+        pos = torch.arange(N - 1, -1, -1, device=k.device, dtype=torch.float32)
+        w = lam.unsqueeze(0) ** pos.unsqueeze(1)
+        ctx.save_for_backward(k, lam, w, pos)
+        if (
+            engine is not None
+            and k.device.type == "cuda"
+            and k.dtype == torch.float32
+            and lam.dtype == torch.float32
+        ):
+            return engine.apply_channel_decay(k.contiguous(), lam.contiguous())
+        return k * w.unsqueeze(0)
+
+    @staticmethod
+    def backward(ctx, grad_k_w):
+        k, lam, w, pos = ctx.saved_tensors
+        grad_k = grad_k_w * w.unsqueeze(0)
+        pos_dim = pos.unsqueeze(1)
+        lam_dim = lam.unsqueeze(0)
+        d_w_d_lam = pos_dim * torch.pow(lam_dim, (pos_dim - 1.0).clamp(min=0.0))
+        grad_lam = (grad_k_w * k * d_w_d_lam.unsqueeze(0)).sum(dim=tuple(range(grad_k_w.dim() - 2)) + (-2,))
+        return grad_k, grad_lam, None
+
+
+class _NormalizeAttentionAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, numer, denom, eps, engine):
+        denom_eps = denom + eps
+        if (
+            engine is not None
+            and numer.device.type == "cuda"
+            and numer.dtype == torch.float32
+            and denom.dtype == torch.float32
+        ):
+            out = engine.fused_normalize_attention(
+                numer.contiguous(), denom.expand_as(numer).contiguous(), float(eps)
+            )
+        else:
+            out = numer / denom_eps
+        ctx.save_for_backward(numer, denom_eps, out)
+        return out
+
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        numer, denom_eps, out = ctx.saved_tensors
+        grad_numer = grad_out / denom_eps
+        grad_denom = -grad_out * out / denom_eps
+        return grad_numer, grad_denom, None, None
 
 
 class AstrocyteHebbianAttention(nn.Module):
@@ -62,7 +103,6 @@ class AstrocyteHebbianAttention(nn.Module):
         self.eps = 1e-6
 
     def forward(self, x):
-        # Supports (B, N, d) and (T, B, N, d) via leading-dim broadcasts.
         leading = x.shape[:-1]
         N = int(leading[-1])
         d = x.shape[-1]
@@ -77,10 +117,8 @@ class AstrocyteHebbianAttention(nn.Module):
             spikes = spike_fn(u01.unsqueeze(-1) - self.tau.view(1, 1, 1, -1))
             v = spikes.mean(dim=-1)
 
-        pos = torch.arange(N - 1, -1, -1, device=x.device, dtype=torch.float32)
         lam = torch.sigmoid(self.decay_logit)
-        w = lam.unsqueeze(0) ** pos.unsqueeze(1)
-        k_w = k * w.unsqueeze(0)
+        k_w = _ChannelDecayAutograd.apply(k, lam, _attn_cuda_engine)
 
         q = q.view(*leading, self.h, self.dh).transpose(-3, -2)
         k_w = k_w.view(*leading, self.h, self.dh).transpose(-3, -2)
@@ -90,11 +128,14 @@ class AstrocyteHebbianAttention(nn.Module):
         key_mass = k_w.sum(dim=-2, keepdim=True).transpose(-2, -1)
 
         numer = torch.matmul(q, kv_trace)
-        denom = torch.matmul(q, key_mass) + self.eps
-        out = numer / denom
+        denom = torch.matmul(q, key_mass)
+
+        out = _NormalizeAttentionAutograd.apply(numer, denom, self.eps, _attn_cuda_engine)
 
         out = out.transpose(-3, -2).contiguous().view(*leading, d)
         return self.o_proj(out)
+
+
 
 
 class SpikingFFN(nn.Module):

@@ -32,10 +32,16 @@ Interface (matches the rest of SpireStack Lite, which is parallel over N):
     downstream attention/FFN interface stays (B, N, d).
 """
 
+import os
 import torch
 import torch.nn as nn
 
 from spikestack_lite.nn.attention import SurrogateHeaviside
+from spikestack_lite._cuda_loader import load_cuda_extension
+
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+_gsmc_cu_file = os.path.join(_src_dir, "gsmc_cuda.cu")
+_gsmc_cuda_engine = load_cuda_extension("gsmc_cuda_engine", [_gsmc_cu_file])
 
 
 class FusedGSMC(nn.Module):
@@ -45,22 +51,6 @@ class FusedGSMC(nn.Module):
                  output_bias: float = -2.0, recurrent_scale: float = 0.5,
                  gate_scale: float = 4.0, pool: str = "mean",
                  adaptive_threshold: bool = True, beta_adapt: float = 0.8):
-        """
-        Args:
-            d_model: token/hidden feature dimension.
-            v_th: firing threshold.
-            forget_bias: init bias on the forget gate (sigmoid(8)~=1 => near-
-                perfect integrator at init, i.e. the constant-error carousel).
-            output_bias: init bias on the output gate (sigmoid(-2)~=0.12 =>
-                mostly silent holding at init).
-            recurrent_scale: scale of the orthogonal recurrent init.
-            gate_scale: weight the fused candidate/input affines so gradient
-                magnitudes are comparable to the source's per-gate Linear init.
-            pool: how to reduce the T axis back to the (B, N, d) interface.
-                'mean' averages T-plane outputs (used by the lite model).
-            adaptive_threshold: LSNN-style adaptive firing threshold.
-            beta_adapt: EMA decay for the adaptive threshold heat-up.
-        """
         super().__init__()
         self.d_model = d_model
         self.v_th = float(v_th)
@@ -80,7 +70,6 @@ class FusedGSMC(nn.Module):
 
         # Bias is folded into W_in.bias; set forget/output gate biases only.
         with torch.no_grad():
-            # gate index order precomputed as contiguous 4*d blocks: f, i, o, g
             self.W_in.bias[: d_model].fill_(forget_bias)      # f
             self.W_in.bias[2 * d_model: 3 * d_model].fill_(output_bias)  # o
 
@@ -94,16 +83,8 @@ class FusedGSMC(nn.Module):
 
         self.spike_fn = SurrogateHeaviside.apply
 
-    def _step_gates(self, x_t, s_prev):
-        """Fused gate computation for one timestep.
-
-        Returns (f, i, o, g) slices from one input matmul and one recurrent
-        matmul. The weight-derived affines are scaled by ``self.gate_scale`` so
-        pre-activations sit in the sigmoid/tanh active region, while the biases
-        are applied at full scale so the forget/output init biases keep their
-        intended effect (forget_bias=8 => sigmoid(8)~=0.999 integrator).
-        """
-        gi = self.W_in(x_t) / self.gate_scale
+    def _step_gates(self, gi_t, s_prev):
+        gi = gi_t / self.gate_scale
         gr = self.W_rec(s_prev) / self.gate_scale
         pre = (gi + gr) + self.W_in.bias
         f = torch.sigmoid(pre[:, : self.d_model])
@@ -113,37 +94,57 @@ class FusedGSMC(nn.Module):
         return f, i, o, g
 
     def forward(self, x, T):
-        """x: (T, B, N, d) Spire time-planes -> (B, N, d) memory-processed.
-
-        Runs the GSMC recurrence over the T planes (folded over B*N rows) and
-        returns the T-mean-pooled hidden spikes at the (B, N, d) interface.
-        """
-        T, B, N, d = x.shape
-        flat = x.reshape(T, -1, d)          # (T, B*N, d)
-
+        """x: (T, B, N, d) Spire time-planes -> (B, N, d) memory-processed."""
+        T_len, B, N, d = x.shape
+        flat = x.reshape(T_len, -1, d)          # (T, B*N, d)
         device = x.device
+
+        # Batched input projections across all T planes at once
+        gi_all = self.W_in(flat)                # (T, B*N, 4d)
+        wd_all = self.W_d(flat)                 # (T, B*N, d)
+
         m = torch.zeros(B * N, d, device=device)
         s = torch.zeros(B * N, d, device=device)
         heat = torch.zeros(B * N, d, device=device)
-        out = torch.empty(T, B * N, d, device=device)
+        out = torch.empty(T_len, B * N, d, device=device)
 
-        for t in range(T):
-            x_t = flat[t]
-            f, i, o, g = self._step_gates(x_t, s)
-            a = f * m + i * g
-            v = o * torch.tanh(a) + self.W_d(x_t)
-            theta_eff = (
-                self.v_th * (1.0 + heat) if self.adaptive_threshold else self.v_th
-            )
-            s_new = self.spike_fn(v - theta_eff)
-            m = a - s_new * self.v_th
-            if self.adaptive_threshold:
-                heat = self.beta_adapt * heat + s_new
-            s = s_new
-            out[t] = s
+        use_cuda = (
+            _gsmc_cuda_engine is not None
+            and device.type == "cuda"
+            and not self.training
+            and not torch.is_grad_enabled()  # Raw CUDA kernel has no backward path.
+        )
+
+
+        for t in range(T_len):
+            gi_t = gi_all[t]
+            wd_t = wd_all[t]
+
+            if use_cuda:
+                gr_t = self.W_rec(s)
+                s_new = _gsmc_cuda_engine.fused_gsmc_step(
+                    gi_t.contiguous(), gr_t.contiguous(), wd_t.contiguous(),
+                    self.W_in.bias.contiguous(), m, s, heat,
+                    self.v_th, self.gate_scale, self.adaptive_threshold, self.beta_adapt
+                )
+            else:
+                f, i, o, g = self._step_gates(gi_t, s)
+                a = f * m + i * g
+                v = o * torch.tanh(a) + wd_t
+                theta_eff = (
+                    self.v_th * (1.0 + heat) if self.adaptive_threshold else self.v_th
+                )
+                s_new = self.spike_fn(v - theta_eff)
+                m = a - s_new * self.v_th
+                if self.adaptive_threshold:
+                    heat = self.beta_adapt * heat + s_new
+                s = s_new
+            out[t] = s_new
 
         if self.pool == "mean":
             pooled = out.mean(dim=0)         # (B*N, d)
         else:
             pooled = out[-1]                 # last-plane readout
         return pooled.view(B, N, d)
+
+

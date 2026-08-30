@@ -31,12 +31,15 @@ def resolve_data_dir():
     if env and os.path.isdir(env):
         return env
     local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    if os.path.isdir(os.path.join(local, "cifar-10-python", "cifar-10-batches-py")):
+        return os.path.join(local, "cifar-10-python")
     if os.path.isdir(os.path.join(local, "cifar-10-batches-py")):
         return local
     if os.path.isdir(LEGACY_DATA_DIR):
         return LEGACY_DATA_DIR
     os.makedirs(local, exist_ok=True)
     return local
+
 
 
 def patchify(images):
@@ -97,7 +100,10 @@ def build_parser():
                              "~10%% CIFAR floor).")
     parser.add_argument("--conv-kernels", type=int, default=32,
                         help="Channels for the conv stem's two conv layers.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable Automatic Mixed Precision (FP16 autocast + GradScaler) for faster GPU Tensor Core throughput")
     return parser
+
 
 
 def make_transform(augment=False):
@@ -218,6 +224,8 @@ def train(args):
         if type(_blk.ffn.fc2).__name__ == "SparseLinear":
             _sparsity_hooks.append(_blk.ffn.fc1.register_forward_hook(_fc2_hook))
 
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
+
     print("\n--- Starting CIFAR-10 Training on SpikeStack Lite ---")
     total_start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
@@ -233,20 +241,24 @@ def train(args):
             images, labels = images.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(model_input(images, filt))
-            loss = criterion(outputs, labels)
-            if args.exact:
-                # Exact-SNN latency regularizer on the smooth pooled context.
-                loss = loss + model.latency_loss(model._pooled_for_latency, labels)
+            with torch.amp.autocast('cuda', enabled=args.amp):
+                outputs = model(model_input(images, filt))
+                loss = criterion(outputs, labels)
+                if args.exact:
+                    loss = loss + model.latency_loss(model._pooled_for_latency, labels)
 
-            loss.backward()
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
+
 
             if (i + 1) % 100 == 0:
                 print(f"Epoch [{epoch + 1}/{args.epochs}], Step [{i + 1}/{len(train_loader)}], "

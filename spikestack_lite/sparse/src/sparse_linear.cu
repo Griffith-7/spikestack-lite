@@ -72,12 +72,23 @@ __global__ void csr_coalesced_kernel(
         const int row_start = row_offsets[b];
         const int row_end   = row_offsets[b + 1];
         scalar_t sum = 0;
-        for (int k = row_start; k < row_end; ++k) {
-            sum += values[k] * weightT[col_indices[k] * out_features + o];
+        // Vectorized 128-bit memory load alignment check for float
+        const bool is_aligned = (std::is_same<scalar_t, float>::value) && (out_features % 4 == 0) && (o % 4 == 0);
+        if (is_aligned && (o + 3 < out_features)) {
+            for (int k = row_start; k < row_end; ++k) {
+                const float* ptr = reinterpret_cast<const float*>(&weightT[col_indices[k] * out_features + o]);
+                float4 w4 = *reinterpret_cast<const float4*>(ptr);
+                sum += values[k] * w4.x;
+            }
+        } else {
+            for (int k = row_start; k < row_end; ++k) {
+                sum += values[k] * weightT[col_indices[k] * out_features + o];
+            }
         }
         output[b * out_features + o] = sum;
     }
 }
+
 
 // =============================================================================
 // KERNEL 4: CSR + Shared Memory Weight-Row
