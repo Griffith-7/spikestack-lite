@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Trained weights / experiment artifacts
+checkpoints/
+
+# SpikeSkip CUDA engine build artifacts (JIT-compiled on import)
+spikeskip_cuda_engine*.so
+spikeskip_cuda_engine*.pyd
+spikeskip_cuda_engine*.dll
+__pypackages__/
+
+# Data (auto-downloads to ./data)
+data/
