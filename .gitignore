@@ -13,6 +13,7 @@ venv/
 
 # Trained weights / experiment artifacts
 checkpoints/
+runs/
 
 # SpikeSkip & CUDA engine build artifacts (JIT-compiled on import)
 *_cuda_engine*.so
@@ -20,5 +21,13 @@ checkpoints/
 *_cuda_engine*.dll
 __pypackages__/
 
+# Precompiled engines bundled into wheels by setup.py (regenerated per build)
+spikestack_lite/_engine/*.pyd
+spikestack_lite/_engine/*.so
+spikestack_lite/_engine/*.dll
+
+# Training logs
+*.log
+
 # Data (auto-downloads to ./data)
-data/
+data/

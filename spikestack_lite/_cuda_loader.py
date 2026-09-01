@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 import glob
@@ -6,6 +7,9 @@ import warnings
 _IS_WIN = sys.platform == "win32"
 _CXX_FLAGS = ["/O2", "/Zc:preprocessor"] if _IS_WIN else ["-O3"]
 _NVCC_FLAGS = ["-O3", "-Xcompiler", "/Zc:preprocessor"] if _IS_WIN else ["-O3"]
+
+# Precompiled engines bundled into production wheels live under this package.
+_ENGINE_PKG = "spikestack_lite._engine"
 
 
 def _setup_toolchain():
@@ -42,6 +46,44 @@ def _setup_toolchain():
             if cl_dir not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = cl_dir + os.pathsep + os.environ.get("PATH", "")
             return
+
+
+def _add_dll_search_dirs():
+    """On Windows, make torch's own DLLs + CUDA runtime findable by importlib."""
+    if not _IS_WIN:
+        return
+    try:
+        import torch
+
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(torch_lib):
+            os.add_dll_directory(torch_lib)
+    except Exception:
+        pass
+    _setup_toolchain()
+    cuda_bin = os.path.join(os.environ.get("CUDA_HOME", ""), "bin")
+    if os.path.isdir(cuda_bin):
+        try:
+            os.add_dll_directory(cuda_bin)
+        except Exception:
+            pass
+
+
+def _load_bundled_extension(name):
+    """Priority 1: load a precompiled engine shipped inside the wheel.
+
+    Production wheels (built by ``setup.py`` with CUDA) bundle the compiled
+    ``.pyd``/``.so`` under ``spikestack_lite/_engine/``. This is the
+    deterministic, JIT-free path: no source hashing, no compiler required.
+    """
+    try:
+        _add_dll_search_dirs()
+        return importlib.import_module(f"{_ENGINE_PKG}.{name}")
+    except ImportError:
+        return None
+    except Exception as e:  # noqa: BLE001
+        warnings.warn(f"Failed to import bundled CUDA extension '{name}': {e}.")
+        return None
 
 
 def _cached_extension_dir(name):
@@ -88,11 +130,18 @@ def _load_cached_extension(name):
 
 
 def load_cuda_extension(name, sources, build_directory=None, _try_cache=True):
-    """Load a CUDA extension with cross-platform compiler flags.
+    """Load a CUDA extension. Resolution order:
 
-    Tries the fast cached-build path first; only falls back to a JIT
-    build when no prebuilt engine exists.
+    1. Precompiled engine bundled in the installed wheel (deterministic, JIT-free)
+    2. Previously-built engine in torch's JIT cache (fast dev path)
+    3. On-demand JIT compile (last resort)
+
+    Returns the engine module, or None when no CUDA/toolchain is available
+    (callers must then fall back to their dense PyTorch implementation).
     """
+    bundled = _load_bundled_extension(name)
+    if bundled is not None:
+        return bundled
     if _try_cache:
         cached = _load_cached_extension(name)
         if cached is not None:

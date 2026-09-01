@@ -1,25 +1,51 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=68", "wheel", "torch", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "spikestack-lite"
-version = "1.1.0"
-description = "5-in-1 spiking transformer: Spire encoder + AstroHebbian spiking attention + SpikeSkip CUDA sparse engine + GSMC memory + Exact-SNN latency head"
+version = "1.2.0"
+description = "Production-grade 5-in-1 spiking transformer: Spire encoder + AstroHebbian spiking attention + SpikeSkip CUDA sparse engine + GSMC memory + Exact-SNN latency head"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+authors = [{ name = "Griffith-7", email = "sumithkuamr5701@gmail.com" }]
+keywords = ["snn", "spiking", "neural-network", "transformer", "neuromorphic", "surrogate-gradient", "cuda"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Griffith-7/spikestack-lite"
+Repository = "https://github.com/Griffith-7/spikestack-lite"
+Issues = "https://github.com/Griffith-7/spikestack-lite/issues"
+
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-xdist", "ruff", "build", "twine"]
+gpu = ["nvidia-ml-py>=11"]
+docs = ["mkdocs", "mkdocstrings-python"]
+bench = ["pandas"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["spikestack_lite*"]
 
 [tool.setuptools.package-data]
-"spikestack_lite.sparse" = ["src/*.cu"]
+"spikestack_lite" = ["**/*.cu"]
+"spikestack_lite._engine" = ["*.pyd", "*.so"]

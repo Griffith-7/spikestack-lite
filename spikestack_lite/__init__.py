@@ -14,4 +14,4 @@ regularizer trained alongside the surrogate path. The core Spire ->
 AstroHebbian(FFN) path stays fully parallel over the sequence.
 """
 
-__version__ = "1.1.0"
+from spikestack_lite._version import __version__  # noqa: E402

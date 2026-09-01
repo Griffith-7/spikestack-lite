@@ -1,0 +1,52 @@
+name: ci
+
+# Runs the automated test suite on Linux / Windows (CPU, and CUDA when a GPU runner is available).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install torch (CPU) + package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+
+      - name: Run test suite (CPU; CUDA/engine tests auto-skip)
+        run: python -m pytest tests -v -x
+
+      - name: Test wheel build (SKIP_CUDA_BUILD pure-python path)
+        run: |
+          $env:SKIP_CUDA_BUILD = "1"
+          python -m pip install build
+          python -m build --wheel
+        shell: pwsh
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install ruff
+      - run: ruff check spikestack_lite tests
