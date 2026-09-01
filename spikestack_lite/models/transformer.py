@@ -44,7 +44,8 @@ class SpikingTransformer(nn.Module):
                  temporal=False, spike_threshold=0.0, use_gsmc=False,
                  gsmc_pool="mean", gsmc_readout=False, use_exact=False,
                  exact_weight=1.0, exact_beta_init=1.0, exact_beta_end=8.0,
-                 use_conv_stem=False, conv_kernels=32):
+                 use_conv_stem=False, conv_kernels=32,
+                 text_vocab=None, padding_idx=0):
         super().__init__()
         self.d_model = d_model
         self.spike_readout = spike_readout
@@ -52,6 +53,7 @@ class SpikingTransformer(nn.Module):
         self.use_gsmc = bool(use_gsmc)
         self.use_exact = bool(use_exact)
         self.use_conv_stem = bool(use_conv_stem)
+        self.use_text = text_vocab is not None
 
         # Phase 0 (optional): convolutional stem. Maps raw (B, 3, 32, 32) images
         # to (B, N, d_model) tokens, giving CIFAR-10 the spatial inductive bias
@@ -62,11 +64,20 @@ class SpikingTransformer(nn.Module):
             self.conv_stem = ConvStem(in_channels=3, d_model=d_model,
                                       seq_len=seq_len, out_kernels=conv_kernels)
 
+        # Phase 0b (optional): text stem. Maps raw token ids (B, N) to
+        # (B, N, d_model) embeddings, the text analog of conv_stem, so the
+        # modality-agnostic spiking core consumes text like any token sequence.
+        self.text_stem = None
+        if self.use_text:
+            from spikestack_lite.nn.text_stem import TextStem
+            self.text_stem = TextStem(vocab_size=text_vocab, d_model=d_model,
+                                      padding_idx=padding_idx)
+
         # Phase 1: Optimal Encoding (Spire) -- dithered multi-spike repetition code.
         # In temporal mode the m repetition planes become a time axis (T, B, N, d);
         # their average equals the non-temporal graded code exactly.
-        # With a conv stem, Spire sees the stem's d_model-wide token features.
-        spire_in = d_model if self.use_conv_stem else input_dim
+        # With a conv or text stem, Spire sees the stem's d_model-wide token features.
+        spire_in = d_model if (self.use_conv_stem or self.use_text) else input_dim
         self.embedding = SpireEncoder(spire_in, d_model, seq_len, n_repeats=n_repeats,
                                       temporal=temporal)
 
@@ -107,6 +118,13 @@ class SpikingTransformer(nn.Module):
         self.use_spikeskip = use_spikeskip
         self.spike_threshold = float(spike_threshold)
         self.classifier = nn.Linear(d_model, num_classes)
+
+        # Language-modeling head (optional, only with text_vocab): a token-level
+        # d_model -> vocab projection for next-token prediction, sharing the same
+        # spiking core as classification but reading out per-token.
+        self.lm_head = None
+        if self.use_text:
+            self.lm_head = nn.Linear(d_model, text_vocab)
 
         # Phase 4 (optional): Exact-SNN soft-latency head. A differentiable
         # TTFS readout supervised with latency cross-entropy (earlier-spike-
@@ -172,3 +190,49 @@ class SpikingTransformer(nn.Module):
         if self.temporal and self.gsmc is None:
             return self.classifier(context.mean(dim=(0, 2)))
         return self.classifier(context.mean(dim=1))
+
+    def forward_text(self, x):
+        """Next-token prediction over token-id input, reusing all 5 mechanisms.
+
+        x: (B, N) long token ids. Returns logits of shape (B, N, vocab) for
+        next-token prediction (shifted targets are handled by the caller).
+
+        The core is identical to ``forward``: Spire encoding -> AstroHebbian
+        attention/FFN -> optional GSMC memory -> optional spike readout. The
+        only difference is the readout: per-token LM logits instead of the
+        mean-pooled classifier, exposing the spiking transformer's abilities
+        to a language-modeling task.
+        """
+        if self.text_stem is None:
+            raise RuntimeError("forward_text requires text_vocab to be set "
+                               "(SpikingTransformer(text_vocab=...))")
+        # Step 0: token ids -> token embeddings.
+        x = self.text_stem(x)                      # (B, N, d_model)
+
+        # Step 1: Spire encoding -> dithered multi-spike codes.
+        context = self.embedding(x)                # (B, N, d) or (T, B, N, d)
+
+        # Step 2: Attention (AstroHebbian processing on spikes).
+        for block in self.blocks:
+            context = block(context)
+
+        # Step 3 (optional): GSMC memory stage over the T-planes.
+        if self.gsmc is not None:
+            context = self.gsmc(context, T=context.shape[0])
+
+        # Pool pre-readout hidden states so the exact latency head (if enabled)
+        # sees a smooth, differentiable quantity on this token task.
+        if self.temporal and self.gsmc is None:
+            self._pooled_for_latency = context.mean(dim=0).mean(dim=1)  # (B, d)
+        else:
+            self._pooled_for_latency = context.mean(dim=1)              # (B, d)
+
+        # Step 4 (optional): spike readout binarizes the residual.
+        if self.spike_readout:
+            context = spike_fn(context)
+
+        # Readout: per-token LM logits.
+        # Temporal-with-GSMC: context folded to (B, N, d).
+        if self.temporal and self.gsmc is None:
+            context = context.mean(dim=0)          # fold T -> (B, N, d)
+        return self.lm_head(context)               # (B, N, vocab)

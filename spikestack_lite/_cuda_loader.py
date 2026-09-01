@@ -44,8 +44,59 @@ def _setup_toolchain():
             return
 
 
-def load_cuda_extension(name, sources, build_directory=None):
-    """Load a CUDA extension with cross-platform compiler flags."""
+def _cached_extension_dir(name):
+    """Return the torch JIT cache dir holding a previously-built engine, if any."""
+    try:
+        import torch
+        from torch.utils.cpp_extension import _get_build_directory
+        return _get_build_directory(name, verbose=False)
+    except Exception:
+        return None
+
+
+def _load_cached_extension(name):
+    """Fast-path: load a previously-built .pyd/.so from torch's JIT cache.
+
+    Calling torch.utils.cpp_extension.load() on every import re-hashes the
+    source files and, when the .cu sources are newer than the cached build
+    (e.g. right after a fresh git clone), triggers a full nvcc/cl rebuild that
+    can hang silently on Windows when the toolchain env isn't fully set up.
+    Here we reuse the already-built engine directly, setting up torch's DLL
+    search paths, which is instant and avoids any recompilation.
+    """
+    try:
+        import torch
+        from torch.utils.cpp_extension import _import_module_from_library
+    except Exception:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    build_dir = _cached_extension_dir(name)
+    if build_dir is None:
+        return None
+    # The built artifact is <name>.pyd (Windows) / <name>.so (Linux).
+    if not any(
+        os.path.exists(os.path.join(build_dir, f))
+        for f in (name + ".pyd", name + ".so")
+    ):
+        return None
+    try:
+        return _import_module_from_library(name, build_dir, True)
+    except Exception as e:
+        warnings.warn(f"Failed to load cached CUDA extension '{name}': {e}.")
+        return None
+
+
+def load_cuda_extension(name, sources, build_directory=None, _try_cache=True):
+    """Load a CUDA extension with cross-platform compiler flags.
+
+    Tries the fast cached-build path first; only falls back to a JIT
+    build when no prebuilt engine exists.
+    """
+    if _try_cache:
+        cached = _load_cached_extension(name)
+        if cached is not None:
+            return cached
     try:
         import torch
         from torch.utils.cpp_extension import load, CUDA_HOME

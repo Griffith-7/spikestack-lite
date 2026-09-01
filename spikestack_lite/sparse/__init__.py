@@ -69,23 +69,14 @@ _src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 _cu_file = os.path.join(_src_dir, "sparse_linear.cu")
 
 if torch.cuda.is_available() and os.path.exists(_cu_file):
-    try:
-        from torch.utils.cpp_extension import load
+    from spikestack_lite._cuda_loader import load_cuda_extension
 
-        _cuda_engine = load(
-            name="spikeskip_cuda_engine",
-            sources=[_cu_file],
-            extra_cuda_cflags=["-O3", "-Xcompiler", "/Zc:preprocessor"],
-            extra_cflags=["-O3", "/Zc:preprocessor"],
-            verbose=False,
-        )
-    except Exception as e:  # noqa: BLE001 - any toolchain/compile failure -> fallback
+    _cuda_engine = load_cuda_extension("spikeskip_cuda_engine", [_cu_file])
+    if _cuda_engine is None:
         print(
-            f"[{_MSG_CTX}] Warning: SpikeSkip CUDA JIT compilation failed. "
-            f"SpikeSkip acceleration will be disabled (falling back to dense). "
-            f"Error: {e}"
+            f"[{_MSG_CTX}] Warning: SpikeSkip CUDA engine unavailable. "
+            f"SpikeSkip acceleration will be disabled (falling back to dense)."
         )
-        _cuda_engine = None
 else:
     if not os.path.exists(_cu_file):
         print(
